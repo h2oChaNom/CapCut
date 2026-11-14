@@ -958,6 +958,7 @@ local snapshot, startEdit, stopEdit, resetAll
 local makeBase, smartApply, reflowAll
 local New
 local ops = {}
+local sty = {}
 
 -- heartbeat + overlap handling
 do
@@ -973,7 +974,7 @@ do
 		local e = selected
 		local s = root.AbsoluteSize
 		local nearHint, nearPanel = false, false
-		if editing and e and e.frame.Visible then
+		if editing and e and e.kind ~= 'credit' and e.frame.Visible then
 			local hw, hh = hint.AbsoluteSize.X, hint.AbsoluteSize.Y
 			nearHint = nearRect(e, (s.X - hw) / 2, s.Y - 16 - hh, hw, hh, hintHidden and 40 or 24)
 			if panelOpen then
@@ -1075,7 +1076,7 @@ do
 
 	function smartApply(e)
 		local base = e.base
-		if not base or editing or not e.frame.Parent then
+		if not base or editing or e.kind == 'credit' or not e.frame.Parent then
 			return
 		end
 		local W, H = screenSize()
@@ -1101,6 +1102,323 @@ do
 	end)
 end
 
+
+-- text / credit styling (color, font, stroke, tiled credit watermark)
+do
+	local FONT_NAMES = {
+		'GothamMedium', 'GothamBold', 'GothamBlack', 'Gotham', 'SourceSansBold', 'SourceSans', 'Arial', 'ArialBold',
+		'Bangers', 'Creepster', 'FredokaOne', 'LuckiestGuy', 'Kalam', 'PatrickHand', 'PermanentMarker', 'SpecialElite',
+		'Oswald', 'Michroma', 'Fondamento', 'Arcade', 'Antique', 'Cartoon', 'Code', 'Highway', 'SciFi', 'Sarpanch',
+		'Ubuntu', 'Nunito', 'Merriweather', 'Montserrat', 'Roboto', 'RobotoMono', 'JosefinSans', 'Jura', 'Garamond', 'Fantasy',
+	}
+	local FONTS = {}
+	for _, n in ipairs(FONT_NAMES) do
+		local ok, f = pcall(function()
+			return Enum.Font[n]
+		end)
+		if ok and f then
+			table.insert(FONTS, f)
+		end
+	end
+	if #FONTS == 0 then
+		FONTS[1] = Enum.Font.GothamMedium
+	end
+	sty.FONTS = FONTS
+
+	sty.SWATCHES = {
+		Color3.fromRGB(255, 255, 255),
+		Color3.fromRGB(0, 0, 0),
+		Color3.fromRGB(255, 80, 80),
+		Color3.fromRGB(255, 185, 60),
+		Color3.fromRGB(255, 235, 90),
+		Color3.fromRGB(108, 203, 95),
+		Color3.fromRGB(96, 205, 255),
+		Color3.fromRGB(180, 140, 255),
+	}
+
+	local function pct(v)
+		return string.format('%d%%', math.floor(v * 100 + 0.5))
+	end
+	local function px(v)
+		return string.format('%dpx', math.floor(v + 0.5))
+	end
+
+	local STEPS = {
+		topacity = { title = 'Opacity', color = OPACITY_COLOR, field = 'tr', inv = true, min = 0, max = 1, step = 0.05, def = 0, fmt = pct },
+		stroke = { title = 'Stroke', color = SNAP_COLOR, field = 'strokeT', min = 0, max = 8, step = 0.5, def = 0, fmt = function(v)
+			return string.format('%.1f', v)
+		end },
+		cstroke = { title = 'Outline', color = SNAP_COLOR, field = 'cs', min = 0, max = 1, step = 0.1, def = 0, fmt = pct },
+		tsize = { title = 'Size', color = SCALE_COLOR, field = 'size', min = 8, max = 150, step = 2, def = 22, fmt = px },
+		angle = { title = 'Angle', color = PAD_COLOR, field = 'angle', min = -90, max = 90, step = 1, def = 30, fmt = function(v)
+			return string.format('%d°', math.floor(v + 0.5))
+		end },
+		gapx = { title = 'Space X', color = PAD_COLOR, field = 'gx', min = 40, max = 800, step = 10, def = 240, fmt = px },
+		gapy = { title = 'Space Y', color = ACCENT, field = 'gy', min = 30, max = 500, step = 10, def = 110, fmt = px },
+	}
+	for _, d in pairs(STEPS) do
+		d.drag = (d.max - d.min) / 200
+	end
+	sty.STEPS = STEPS
+
+	local function enumItem(enum, name)
+		local ok, v = pcall(function()
+			return enum[name]
+		end)
+		return ok and v or nil
+	end
+
+	local function tileStyle(e, lab)
+		local st = e.style
+		lab.Text = st.text
+		lab.TextColor3 = st.color
+		lab.Font = st.font
+		lab.TextSize = st.size
+		lab.TextTransparency = st.tr
+		lab.TextStrokeTransparency = 1 - st.cs
+		lab.TextStrokeColor3 = Color3.new(0, 0, 0)
+	end
+
+	function sty.apply(e)
+		local st = e.style
+		if not st then
+			return
+		end
+		if e.kind == 'text' then
+			local f = e.frame
+			f.TextColor3 = st.color
+			f.Font = st.font
+			f.TextTransparency = st.tr
+			if e.strokeObj then
+				e.strokeObj.Thickness = st.strokeT
+				e.strokeObj.Enabled = st.strokeT > 0
+			end
+		elseif e.kind == 'credit' then
+			if e.holder then
+				e.holder.Rotation = st.angle
+			end
+			if e.tiles then
+				for _, lab in ipairs(e.tiles) do
+					tileStyle(e, lab)
+				end
+			end
+		end
+	end
+
+	function sty.rebuild(e)
+		local holder = e.holder
+		if not holder or not holder.Parent then
+			return
+		end
+		holder:ClearAllChildren()
+		local tiles = {}
+		e.tiles = tiles
+		local st = e.style
+		local W, H = screenSize()
+		local diag = math.ceil(math.sqrt(W * W + H * H)) + 8
+		holder.Size = UDim2.fromOffset(diag, diag)
+		holder.Rotation = st.angle
+		local sx, sy = math.max(st.gx, 20), math.max(st.gy, 16)
+		local cols, rows = math.ceil(diag / sx) + 2, math.ceil(diag / sy) + 1
+		while cols * rows > 900 do
+			sx, sy = sx * 1.25, sy * 1.25
+			cols, rows = math.ceil(diag / sx) + 2, math.ceil(diag / sy) + 1
+		end
+		for r = 0, rows - 1 do
+			local off = (r % 2) * sx / 2
+			for c = -1, cols - 2 do
+				local lab = Instance.new('TextLabel')
+				lab.AnchorPoint = Vector2.new(0.5, 0.5)
+				lab.AutomaticSize = Enum.AutomaticSize.XY
+				lab.Size = UDim2.fromOffset(0, 0)
+				lab.BackgroundTransparency = 1
+				lab.BorderSizePixel = 0
+				lab.TextWrapped = false
+				lab.Position = UDim2.fromOffset(off + c * sx, r * sy)
+				tileStyle(e, lab)
+				lab.Parent = holder
+				tiles[#tiles + 1] = lab
+			end
+		end
+	end
+
+	function sty.schedule(e)
+		local token = {}
+		e.rbToken = token
+		task.delay(0.06, function()
+			if e.rbToken == token then
+				sty.rebuild(e)
+			end
+		end)
+	end
+
+	function sty.init(e, config)
+		if e.kind == 'text' then
+			local f = e.frame
+			e.style = { color = f.TextColor3, font = f.Font, tr = f.TextTransparency, strokeT = 0 }
+			local stroke = Instance.new('UIStroke')
+			stroke.Thickness = 0
+			stroke.Enabled = false
+			stroke.Color = Color3.new(0, 0, 0)
+			stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+			stroke.Parent = f
+			e.strokeObj = stroke
+		elseif e.kind == 'credit' then
+			local c = config or {}
+			e.style = {
+				color = typeof(c.TextColor3) == 'Color3' and c.TextColor3 or Color3.new(1, 1, 1),
+				font = typeof(c.Font) == 'EnumItem' and c.Font or Enum.Font.GothamBold,
+				tr = type(c.TextTransparency) == 'number' and c.TextTransparency or 0.6,
+				cs = 0,
+				text = tostring(c.Text or 'Credit'),
+				size = type(c.TextSize) == 'number' and c.TextSize or 22,
+				angle = type(c.Angle) == 'number' and c.Angle or 30,
+				gx = type(c.SpaceX) == 'number' and c.SpaceX or 240,
+				gy = type(c.SpaceY) == 'number' and c.SpaceY or 110,
+			}
+			local holder = Instance.new('Frame')
+			holder.Name = 'Tiles'
+			holder.AnchorPoint = Vector2.new(0.5, 0.5)
+			holder.Position = UDim2.fromScale(0.5, 0.5)
+			holder.BackgroundTransparency = 1
+			holder.BorderSizePixel = 0
+			holder.Parent = e.frame
+			e.holder = holder
+			sty.rebuild(e)
+		end
+	end
+
+	function sty.copy(e)
+		local c = {}
+		for k, v in pairs(e.style) do
+			c[k] = v
+		end
+		return c
+	end
+
+	function sty.restore(e, st)
+		local c = {}
+		for k, v in pairs(st) do
+			c[k] = v
+		end
+		e.style = c
+		sty.apply(e)
+		if e.kind == 'credit' then
+			sty.rebuild(e)
+		end
+	end
+
+	function sty.setField(e, field, v)
+		if not e.style then
+			return
+		end
+		e.style[field] = v
+		e.touched = true
+		e.reset = false
+		e.styleEdited = true
+		sty.apply(e)
+		if e.kind == 'credit' and (field == 'gx' or field == 'gy') then
+			sty.schedule(e)
+		end
+		refreshReadout(e)
+	end
+
+	function sty.getVal(e, kind)
+		local d = STEPS[kind]
+		local v = e.style[d.field]
+		if d.inv then
+			v = 1 - v
+		end
+		return v
+	end
+
+	function sty.setVal(e, kind, v)
+		local d = STEPS[kind]
+		v = math.clamp(math.floor(v / d.step + 0.5) * d.step, d.min, d.max)
+		if d.inv then
+			v = 1 - v
+		end
+		sty.setField(e, d.field, math.floor(v * 1000 + 0.5) / 1000)
+	end
+
+	function sty.fmt(e, kind)
+		return STEPS[kind].fmt(sty.getVal(e, kind))
+	end
+
+	function sty.resetVal(e, kind)
+		local d = STEPS[kind]
+		local dv = e.def and e.def.style and e.def.style[d.field]
+		if dv == nil then
+			dv = d.def
+		end
+		sty.setField(e, d.field, dv)
+	end
+
+	function sty.serialize(e)
+		local st = e.style
+		return {
+			c = st.color:ToHex(),
+			f = st.font.Name,
+			tr = st.tr,
+			st = st.strokeT,
+			cs = st.cs,
+			tx = st.text,
+			sz = st.size,
+			an = st.angle,
+			gx = st.gx,
+			gy = st.gy,
+		}
+	end
+
+	function sty.load(e, d)
+		local st = e.style
+		if not st or type(d) ~= 'table' then
+			return
+		end
+		if type(d.c) == 'string' then
+			local ok, col = pcall(Color3.fromHex, d.c)
+			if ok and col then
+				st.color = col
+			end
+		end
+		local fnt = type(d.f) == 'string' and enumItem(Enum.Font, d.f)
+		if fnt then
+			st.font = fnt
+		end
+		local function num(key, field)
+			if type(d[key]) == 'number' then
+				st[field] = d[key]
+			end
+		end
+		num('tr', 'tr')
+		if e.kind == 'text' then
+			num('st', 'strokeT')
+		else
+			num('cs', 'cs')
+			num('sz', 'size')
+			num('an', 'angle')
+			num('gx', 'gx')
+			num('gy', 'gy')
+			if type(d.tx) == 'string' then
+				st.text = d.tx
+			end
+		end
+		e.styleEdited = true
+		sty.apply(e)
+		if e.kind == 'credit' then
+			sty.rebuild(e)
+		end
+	end
+
+	root:GetPropertyChangedSignal('AbsoluteSize'):Connect(function()
+		for _, e in pairs(entries) do
+			if e.kind == 'credit' then
+				sty.schedule(e)
+			end
+		end
+	end)
+end
+
 -- drag / snapping / value operations
 do
 	local SNAP = 10
@@ -1109,6 +1427,7 @@ do
 	local MIN_SCALE = 0.4
 	local MAX_SCALE = 3
 	local MAX_PAD = 80
+	local STEPS = sty.STEPS
 
 	local function snapStep(n, size)
 		return math.floor(n * size + 0.5) / size
@@ -1191,7 +1510,7 @@ do
 		consider(0, nil)
 		consider(1, nil)
 		for _, o in pairs(entries) do
-			if o ~= self and o.frame.Visible then
+			if o ~= self and o.kind ~= 'credit' and o.frame.Visible then
 				local l, t, r, b = getRect(o)
 				if axis == 'x' then
 					consider(l, o)
@@ -1335,6 +1654,8 @@ do
 					value = padText
 				elseif kind == 'opacity' then
 					value = string.format('%d%%', math.floor((1 - e.frame.ImageTransparency) * 100 + 0.5))
+				elseif STEPS[kind] then
+					value = sty.fmt(e, kind)
 				else
 					value = string.format('%.2fx', targetK(e))
 				end
@@ -1435,12 +1756,18 @@ do
 		setOpacity(e, (1 - e.frame.ImageTransparency) + delta)
 	end
 
+	function ops.stepGeneric(e, kind, dir)
+		sty.setVal(e, kind, sty.getVal(e, kind) + dir * STEPS[kind].step)
+	end
+
 	function ops.resetControl(e, kind)
 		local l, t, r, b = targetRect(e)
 		if kind == 'pad' then
 			setPadding(e, e.defaultPadX, e.defaultPadY, l, t, r, b)
 		elseif kind == 'opacity' then
 			setOpacity(e, 1 - (e.defaultImgTr or 0))
+		elseif STEPS[kind] then
+			sty.resetVal(e, kind)
 		else
 			setScale(e, e.defaultScale, targetK(e), l, t, r, b)
 		end
@@ -1464,6 +1791,12 @@ do
 		local gx, gy
 		e.touched = true
 		e.reset = false
+
+		local desc = STEPS[d.mode]
+		if desc then
+			sty.setVal(e, d.mode, d.v0 + dxp * desc.drag)
+			return
+		end
 
 		if d.mode == 'scale' then
 			local nk = math.clamp(d.k + dxp / 200, MIN_SCALE, MAX_SCALE)
@@ -1577,6 +1910,7 @@ do
 			padx = padx,
 			pady = pady,
 			op = e.kind == 'image' and (1 - e.frame.ImageTransparency) or 1,
+			v0 = STEPS[mode] and sty.getVal(e, mode) or nil,
 		}
 	end
 end
@@ -1601,7 +1935,7 @@ do
 		end
 		for _, h in ipairs(e.handles) do
 			if h.kind ~= 'corner' then
-				h.frame.Position = UDim2.fromOffset(cur.X, cur.Y + (h.row or ROW_Y[h.kind] or 0))
+				h.frame.Position = UDim2.fromOffset(cur.X + (h.col or 0) * 188 - ((e.ncols or 1) - 1) * 94, cur.Y + (h.row or ROW_Y[h.kind] or 0))
 			end
 		end
 	end
@@ -1615,7 +1949,11 @@ do
 			box.Size = UDim2.fromOffset(z.X, z.Y)
 			local rs = root.AbsoluteSize
 			local tbh = e.tbH or TB_H
-			local cx = math.clamp(p.X + z.X / 2, 94, math.max(94, rs.X - 94))
+			local half = (e.tbW or 188) / 2
+			local cx = math.clamp(p.X + z.X / 2, half, math.max(half, rs.X - half))
+			if e.kind == 'credit' then
+				cx = math.max(half, rs.X - half - 16)
+			end
 			local py
 			if p.Y + z.Y + 14 + tbh + 8 <= rs.Y then
 				py = p.Y + z.Y + 14
@@ -1626,6 +1964,9 @@ do
 			end
 			if not e.handles then
 				return
+			end
+			if e.kind == 'credit' then
+				py = math.max(0, (rs.Y - tbh) / 2)
 			end
 			e.tb = Vector2.new(cx, py)
 			if not e.tbCur then
@@ -1701,8 +2042,8 @@ do
 			return
 		end
 		local on = selected == e
-		box.ZIndex = on and 100 or 99
-		TweenService:Create(box, FADE, { BackgroundTransparency = on and 0.88 or 0.96 }):Play()
+		box.ZIndex = on and 100 or (e.kind == 'credit' and 97 or 99)
+		TweenService:Create(box, FADE, { BackgroundTransparency = e.kind == 'credit' and 1 or (on and 0.88 or 0.96) }):Play()
 		TweenService:Create(e.boxStroke, FADE, { Color = ACCENT, Transparency = on and 0 or 0.55, Thickness = on and 2 or 1 }):Play()
 		TweenService:Create(e.tag, FADE, { BackgroundColor3 = ACCENT, BackgroundTransparency = on and 0 or 0.45, TextTransparency = 0 }):Play()
 	end
@@ -1784,6 +2125,8 @@ do
 				stepPadding(e, dir)
 			elseif kind == 'opacity' then
 				stepOpacity(e, dir * 0.05)
+			elseif sty.STEPS[kind] then
+				ops.stepGeneric(e, kind, dir)
 			else
 				stepScale(e, dir * 0.05)
 			end
@@ -2081,7 +2424,7 @@ do
 		box.TextSize = 12
 		box.TextColor3 = WHITE
 		box.PlaceholderColor3 = Color3.fromRGB(140, 140, 140)
-		box.PlaceholderText = mode == 'image' and 'Image id or .png link' or 'Type text'
+		box.PlaceholderText = (mode == 'image' and 'Image id or .png link') or (mode == 'hex' and '#RRGGBB') or 'Type text'
 		box.TextXAlignment = Enum.TextXAlignment.Left
 		box.ZIndex = 104
 		box.Parent = f
@@ -2089,6 +2432,12 @@ do
 		local function current()
 			if mode == 'image' then
 				return e.imageSrc or ''
+			end
+			if mode == 'hex' then
+				return '#' .. e.style.color:ToHex():upper()
+			end
+			if mode == 'ctext' then
+				return e.style.text
 			end
 			return e.frame.Text
 		end
@@ -2108,6 +2457,15 @@ do
 					applyImage(e, box.Text)
 				end
 			end
+			if mode == 'hex' then
+				local hx = box.Text:gsub('[#%s]', '')
+				local ok, col = pcall(Color3.fromHex, hx)
+				if #hx == 6 and ok and col then
+					sty.setField(e, 'color', col)
+				else
+					box.Text = current()
+				end
+			end
 		end)
 
 		if mode == 'text' then
@@ -2121,9 +2479,17 @@ do
 			end)
 		end
 
+		if mode == 'ctext' then
+			box:GetPropertyChangedSignal('Text'):Connect(function()
+				if box:IsFocused() then
+					sty.setField(e, 'text', box.Text)
+				end
+			end)
+		end
+
 		return {
 			frame = wrap,
-			kind = 'input',
+			kind = (mode == 'hex') and 'hex' or 'input',
 			sync = function()
 				if not box:IsFocused() then
 					box.Text = current()
@@ -2132,13 +2498,121 @@ do
 		}
 	end
 
+
+	local function rowShell()
+		local wrap = makeWrap()
+		local f = Instance.new('Frame')
+		f.Position = UDim2.fromOffset(2, 2)
+		f.Size = UDim2.fromOffset(176, 32)
+		f.BackgroundColor3 = DARK
+		f.BackgroundTransparency = 0.06
+		f.BorderSizePixel = 0
+		f.ZIndex = 102
+		f.Parent = wrap
+		addCorner(f, 8)
+		addStroke(f, WHITE, 0.88, 1)
+		return wrap, f
+	end
+
+	local function makeFont(e)
+		local wrap, f = rowShell()
+		local function btn(text, x, w, size)
+			local b = Instance.new('TextButton')
+			b.Position = UDim2.fromOffset(x, 2)
+			b.Size = UDim2.fromOffset(w, 28)
+			b.BackgroundColor3 = WHITE
+			b.BackgroundTransparency = 1
+			b.AutoButtonColor = false
+			b.Font = Enum.Font.GothamMedium
+			b.TextSize = size
+			b.TextColor3 = WHITE
+			b.Text = text
+			b.ZIndex = 103
+			b.Parent = f
+			return b
+		end
+		local prev = btn('‹', 2, 28, 18)
+		local mid = btn('', 32, 112, 13)
+		local nxt = btn('›', 146, 28, 18)
+		mid.TextTruncate = Enum.TextTruncate.AtEnd
+		addCorner(prev, 6)
+		addCorner(nxt, 6)
+		for _, b in ipairs({ prev, nxt }) do
+			b.MouseEnter:Connect(function()
+				TweenService:Create(b, HOVER, { BackgroundTransparency = 0.9 }):Play()
+			end)
+			b.MouseLeave:Connect(function()
+				TweenService:Create(b, HOVER, { BackgroundTransparency = 1 }):Play()
+			end)
+		end
+		local function shift(dir)
+			local list = sty.FONTS
+			local i = table.find(list, e.style.font) or 1
+			i = (i - 1 + dir) % #list + 1
+			sty.setField(e, 'font', list[i])
+		end
+		prev.MouseButton1Click:Connect(function()
+			shift(-1)
+		end)
+		nxt.MouseButton1Click:Connect(function()
+			shift(1)
+		end)
+		mid.MouseButton1Click:Connect(function()
+			shift(1)
+		end)
+		return {
+			frame = wrap,
+			kind = 'font',
+			sync = function()
+				mid.Text = e.style.font.Name
+				mid.Font = e.style.font
+			end,
+		}
+	end
+
+	local function makeSwatches(e)
+		local wrap, f = rowShell()
+		local items = {}
+		for i, col in ipairs(sty.SWATCHES) do
+			local b = Instance.new('TextButton')
+			b.Position = UDim2.fromOffset(7 + (i - 1) * 21, 7)
+			b.Size = UDim2.fromOffset(18, 18)
+			b.BackgroundColor3 = col
+			b.AutoButtonColor = false
+			b.Text = ''
+			b.BorderSizePixel = 0
+			b.ZIndex = 103
+			b.Parent = f
+			addCorner(b, 5)
+			local st = addStroke(b, ACCENT, 1, 2)
+			b.MouseButton1Click:Connect(function()
+				sty.setField(e, 'color', col)
+			end)
+			items[i] = { stroke = st, color = col }
+		end
+		return {
+			frame = wrap,
+			kind = 'swatch',
+			sync = function()
+				for _, it in ipairs(items) do
+					local on = it.color == e.style.color
+					TweenService:Create(it.stroke, HOVER, { Transparency = on and 0 or 1 }):Play()
+				end
+			end,
+		}
+	end
+
+	local function gen(e, kind)
+		local d = sty.STEPS[kind]
+		return makeStepper(e, kind, d.title, d.color)
+	end
+
 	local function makeControls(e)
 		if e.handles or not e.box then
 			return
 		end
 		local handles = {}
-		for cx = 0, 1 do
-			for cy = 0, 1 do
+		for cx = 0, (e.kind == 'credit' and -1 or 1) do for cy = 0, 1 do
 				local h = Instance.new('Frame')
 				h.AnchorPoint = Vector2.new(0.5, 0.5)
 				h.Size = UDim2.fromOffset(28, 28)
@@ -2172,8 +2646,24 @@ do
 			table.insert(handles, makeStepper(e, 'opacity', 'Opacity', OPACITY_COLOR))
 			table.insert(handles, makeInput(e, 'image'))
 		elseif e.kind == 'text' then
-			table.insert(handles, makeStepper(e, 'scale', 'Scale', SCALE_COLOR))
 			table.insert(handles, makeInput(e, 'text'))
+			table.insert(handles, makeFont(e))
+			table.insert(handles, makeSwatches(e))
+			table.insert(handles, makeInput(e, 'hex'))
+			table.insert(handles, makeStepper(e, 'scale', 'Scale', SCALE_COLOR))
+			table.insert(handles, gen(e, 'topacity'))
+			table.insert(handles, gen(e, 'stroke'))
+		elseif e.kind == 'credit' then
+			table.insert(handles, makeInput(e, 'ctext'))
+			table.insert(handles, makeFont(e))
+			table.insert(handles, makeSwatches(e))
+			table.insert(handles, makeInput(e, 'hex'))
+			table.insert(handles, gen(e, 'topacity'))
+			table.insert(handles, gen(e, 'cstroke'))
+			table.insert(handles, gen(e, 'tsize'))
+			table.insert(handles, gen(e, 'angle'))
+			table.insert(handles, gen(e, 'gapx'))
+			table.insert(handles, gen(e, 'gapy'))
 		else
 			table.insert(handles, makeStepper(e, 'pad', 'Padding', PAD_COLOR))
 			table.insert(handles, makeStepper(e, 'scale', 'Scale', SCALE_COLOR))
@@ -2181,16 +2671,23 @@ do
 			table.insert(handles, makeDirRow(e))
 		end
 
-		local row = 0
-		e.ui = {}
+		local list = {}
 		for _, h in ipairs(handles) do
 			if h.kind ~= 'corner' then
-				h.row = row
-				row += 40
-				e.ui[h.kind] = h
+				table.insert(list, h)
 			end
 		end
-		e.tbH = row - 4
+		local ncols = math.max(1, math.ceil(#list / 5))
+		local per = math.max(1, math.ceil(#list / ncols))
+		e.ui = {}
+		for i, h in ipairs(list) do
+			h.col = math.floor((i - 1) / per)
+			h.row = ((i - 1) % per) * 40
+			e.ui[h.kind] = h
+		end
+		e.ncols = ncols
+		e.tbW = ncols * 188 - 8
+		e.tbH = per * 40 - 4
 		e.handles = handles
 		updateBox(e)
 		refreshReadout(e)
@@ -2224,14 +2721,14 @@ do
 		box.BackgroundColor3 = ACCENT
 		box.BackgroundTransparency = 1
 		box.BorderSizePixel = 0
-		box.Active = true
+		box.Active = e.kind ~= 'credit'
 		box.ZIndex = 99
 		box.Parent = root
 		local boxStroke = addStroke(box, ACCENT, 1, 1)
 
 		local tag = Instance.new('TextLabel')
-		tag.AnchorPoint = Vector2.new(0, 1)
-		tag.Position = UDim2.new(0, 0, 0, -8)
+		tag.AnchorPoint = e.kind == 'credit' and Vector2.new(0, 0) or Vector2.new(0, 1)
+		tag.Position = e.kind == 'credit' and UDim2.fromOffset(12, 12) or UDim2.new(0, 0, 0, -8)
 		tag.Size = UDim2.fromOffset(0, 0)
 		tag.AutomaticSize = Enum.AutomaticSize.XY
 		tag.BackgroundColor3 = ACCENT
@@ -2257,8 +2754,7 @@ do
 		boxStyle(e)
 
 		box.InputBegan:Connect(function(input)
-			if isPress(input) and not drag then
-				selectEntry(e)
+			if e.kind ~= 'credit' and isPress(input) and not drag then selectEntry(e)
 				beginDrag(e, 'move', 0, 0, input)
 			end
 		end)
@@ -2585,6 +3081,7 @@ do
 					e.textEdited and e.frame.Text or '',
 					e.srcEdited and (e.imageSrc or '') or '',
 					e.trEdited and e.frame.ImageTransparency or -1,
+					e.styleEdited and sty.serialize(e) or false,
 				}
 				e.base = makeBase(e, W, H)
 			elseif e.reset then
@@ -2617,8 +3114,12 @@ do
 			te = e.textEdited,
 			se = e.srcEdited,
 			re = e.trEdited,
+			style = e.style and sty.copy(e) or nil,
+			ye = e.styleEdited,
 		}
 	end
+
+	ops.captureState = captureState
 
 	local function restore(e, st)
 		stopAnim(e)
@@ -2644,6 +3145,10 @@ do
 			end
 		end
 		e.textEdited, e.srcEdited, e.trEdited = st.te, st.se, st.re
+		e.styleEdited = st.ye
+		if st.style and e.style then
+			sty.restore(e, st.style)
+		end
 		if e.frame.Visible ~= st.vis then
 			e.frame.Visible = st.vis
 			if editing then
@@ -2863,29 +3368,9 @@ do
 				e.trEdited = true
 			end
 		end
-	end
-
-	-- captureState is local to the lifecycle block, so build the default snapshot here
-	local function defState(e)
-		local padx, pady = getPad(e)
-		return {
-			scale = e.uiscale.Scale,
-			pos = e.frame.Position,
-			size = e.frame.Size,
-			padx = padx,
-			pady = pady,
-			ha = e.layout.HorizontalAlignment.Name,
-			va = e.layout.VerticalAlignment.Name,
-			fd = e.layout.FillDirection.Name,
-			sc = e.layout:IsA('UIGridLayout') and e.layout.StartCorner.Name or nil,
-			vis = e.frame.Visible,
-			text = e.kind == 'text' and e.frame.Text or nil,
-			img = e.kind == 'image' and (e.imageSrc or '') or nil,
-			tr = e.kind == 'image' and e.frame.ImageTransparency or nil,
-			te = e.textEdited,
-			se = e.srcEdited,
-			re = e.trEdited,
-		}
+		if e.style and type(d[18]) == 'table' then
+			sty.load(e, d[18])
+		end
 	end
 
 	function New(config)
@@ -2896,6 +3381,8 @@ do
 			kind = 'image'
 		elseif tname == 'text' or tname == 'textlabel' then
 			kind = 'text'
+		elseif tname == 'credit' then
+			kind = 'credit'
 		end
 
 		local frame
@@ -2909,18 +3396,22 @@ do
 			frame.TextColor3 = WHITE
 			frame.Text = 'Text'
 			frame.Size = UDim2.fromScale(0.3, 0.08)
+		elseif kind == 'credit' then
+			frame = Instance.new('Frame')
+			frame.Size = UDim2.fromScale(1, 1)
+			frame.ClipsDescendants = true
 		else
 			frame = Instance.new('Frame')
 			frame.Size = UDim2.fromScale(0.3, 0.3)
 		end
-		frame.Name = config.Name or 'UIFrame'
+		frame.Name = config.Name or (kind == 'credit' and 'Credit' or 'UIFrame')
 		frame.BackgroundTransparency = 1
 		frame.BorderSizePixel = 0
 
 		local layout = Instance.new((kind == 'layout' and config.Layout == 'Grid') and 'UIGridLayout' or 'UIListLayout')
 		layout.FillDirection = Enum.FillDirection[config.FillDirection or 'Vertical']
 		layout.SortOrder = Enum.SortOrder.LayoutOrder
-		layout.Parent = frame
+		layout.Parent = (kind ~= 'credit') and frame or nil
 
 		local uiscale = Instance.new('UIScale')
 		uiscale.Scale = config.Scale or 1
@@ -2961,13 +3452,14 @@ do
 			reset = false,
 		}
 		e.defaultPadX, e.defaultPadY = getPad(e)
+		sty.init(e, config)
 		if kind == 'image' then
 			e.defaultImgTr = frame.ImageTransparency
 			if config.Image ~= nil then
 				applyImage(e, config.Image)
 			end
 		end
-		e.def = defState(e)
+		e.def = ops.captureState(e)
 		entries[key] = e
 		frame.Parent = root
 
