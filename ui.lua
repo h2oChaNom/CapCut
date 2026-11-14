@@ -5,7 +5,7 @@ local RunService = game:GetService('RunService')
 local HttpService = game:GetService('HttpService')
 local TextService = game:GetService('TextService')
 
-local playerGui = (type(gethui) == 'function' and gethui()) or Players.LocalPlayer:WaitForChild('PlayerGui')
+local playerGui = RunService:IsStudio() and Players.LocalPlayer.PlayerGui or game:GetService('CoreGui')
 
 local SNAP = 10
 local MIN_SIZE = 0.03
