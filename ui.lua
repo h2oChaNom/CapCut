@@ -25,6 +25,7 @@ local INK = Color3.fromRGB(20, 20, 20)
 local MUTED = Color3.fromRGB(190, 190, 190)
 local PAD_COLOR = Color3.fromRGB(108, 203, 95)
 local SCALE_COLOR = Color3.fromRGB(255, 185, 60)
+local OPACITY_COLOR = Color3.fromRGB(180, 140, 255)
 local SNAP_COLOR = Color3.fromRGB(255, 120, 200)
 
 local HOVER = TweenInfo.new(0.12)
@@ -183,6 +184,97 @@ if canFile then
 	end)
 	if ok and type(data) == 'table' then
 		layouts = data
+	end
+end
+
+local getAsset = (type(getcustomasset) == 'function' and getcustomasset) or (type(getsynasset) == 'function' and getsynasset) or nil
+local imageCache = {}
+
+local function hashStr(s)
+	local h = 5381
+	for i = 1, #s do
+		h = (h * 33 + s:byte(i)) % 4294967296
+	end
+	return string.format('%08x', h)
+end
+
+local function fetchBody(url)
+	local req = (type(request) == 'function' and request) or (type(http_request) == 'function' and http_request) or (syn and type(syn.request) == 'function' and syn.request) or nil
+	if req then
+		local ok, res = pcall(req, { Url = url, Method = 'GET' })
+		if ok and type(res) == 'table' and res.Body and (res.StatusCode == nil or res.StatusCode == 200) then
+			return res.Body
+		end
+	end
+	local ok, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if ok and type(body) == 'string' then
+		return body
+	end
+	return nil
+end
+
+local function loadUrlImage(url)
+	if imageCache[url] then
+		return imageCache[url]
+	end
+	if not (getAsset and canFile) then
+		return nil
+	end
+	local path = FOLDER .. '/img_' .. hashStr(url) .. '.png'
+	local ok = pcall(function()
+		if not isfile(path) then
+			local body = fetchBody(url)
+			if not body then
+				error('download failed')
+			end
+			writefile(path, body)
+		end
+	end)
+	if not ok then
+		return nil
+	end
+	local okA, asset = pcall(getAsset, path)
+	if okA and asset then
+		imageCache[url] = asset
+		return asset
+	end
+	return nil
+end
+
+local function directAsset(src)
+	local s = tostring(src):gsub('%s+', '')
+	if s:match('^%d+$') then
+		return 'rbxassetid://' .. s
+	end
+	if s:match('^rbxassetid://') or s:match('^rbxasset://') or s:match('^rbxthumb://') or s:match('^https?://www%.roblox%.com/asset') then
+		return s
+	end
+	return nil
+end
+
+local function applyImage(e, src)
+	src = tostring(src or '')
+	e.imageSrc = src
+	local token = {}
+	e.imgToken = token
+	if src == '' then
+		e.frame.Image = ''
+		return
+	end
+	local direct = directAsset(src)
+	if direct then
+		e.frame.Image = direct
+		return
+	end
+	if src:match('^https?://') then
+		task.spawn(function()
+			local asset = loadUrlImage(src)
+			if asset and e.imgToken == token and e.frame.Parent then
+				e.frame.Image = asset
+			end
+		end)
 	end
 end
 
@@ -929,6 +1021,20 @@ local function applySaved(e)
 	if d[10] ~= nil then
 		e.frame.Visible = d[10]
 	end
+	if e.kind == 'text' and type(d[15]) == 'string' and d[15] ~= '' then
+		e.frame.Text = d[15]
+		e.textEdited = true
+	end
+	if e.kind == 'image' then
+		if type(d[16]) == 'string' and d[16] ~= '' then
+			applyImage(e, d[16])
+			e.srcEdited = true
+		end
+		if type(d[17]) == 'number' and d[17] >= 0 then
+			e.frame.ImageTransparency = d[17]
+			e.trEdited = true
+		end
+	end
 end
 
 local function propsRect(e)
@@ -1219,7 +1325,14 @@ local function refreshReadout(e)
 		if h.sync then
 			h.sync()
 		else
-			local value = kind == 'pad' and padText or string.format('%.2fx', targetK(e))
+			local value
+			if kind == 'pad' then
+				value = padText
+			elseif kind == 'opacity' then
+				value = string.format('%d%%', math.floor((1 - e.frame.ImageTransparency) * 100 + 0.5))
+			else
+				value = string.format('%.2fx', targetK(e))
+			end
 			h.mid.Text = string.format("<font color='#%s'>%s</font>  <b>%s</b>", h.color:ToHex(), h.title, value)
 			local on = active == kind
 			TweenService:Create(h.stroke, HOVER, {
@@ -1259,6 +1372,14 @@ local function setScale(e, newK, k0, l, t, r, b)
 	local nl = math.max(0, math.min(l, 1 - nw))
 	local nt = math.max(0, math.min(t, 1 - nh))
 	moveTo(e, nl, nt, nl + nw, nt + nh, k0 * ratio)
+	refreshReadout(e)
+end
+
+local function setOpacity(e, v)
+	e.touched = true
+	e.reset = false
+	e.trEdited = true
+	e.frame.ImageTransparency = 1 - math.clamp(math.floor(v * 100 + 0.5) / 100, 0, 1)
 	refreshReadout(e)
 end
 
@@ -1305,10 +1426,16 @@ local function stepScale(e, delta)
 	setScale(e, math.clamp(math.floor((k + delta) * 100 + 0.5) / 100, MIN_SCALE, MAX_SCALE), k, l, t, r, b)
 end
 
+local function stepOpacity(e, delta)
+	setOpacity(e, (1 - e.frame.ImageTransparency) + delta)
+end
+
 local function resetControl(e, kind)
 	local l, t, r, b = targetRect(e)
 	if kind == 'pad' then
 		setPadding(e, e.defaultPadX, e.defaultPadY, l, t, r, b)
+	elseif kind == 'opacity' then
+		setOpacity(e, 1 - (e.defaultImgTr or 0))
 	else
 		setScale(e, e.defaultScale, targetK(e), l, t, r, b)
 	end
@@ -1342,6 +1469,11 @@ local function updateDrag()
 	if d.mode == 'pad' then
 		local delta = math.floor(dxp * 0.3 + 0.5)
 		setPadding(e, math.clamp(d.padx + delta, 0, MAX_PAD), math.clamp(d.pady + delta, 0, MAX_PAD), l, t, r, b)
+		return
+	end
+
+	if d.mode == 'opacity' then
+		setOpacity(e, math.clamp(d.op + dxp / 200, 0, 1))
 		return
 	end
 
@@ -1457,6 +1589,7 @@ local function beginDrag(e, mode, cx, cy, input)
 		k = e.uiscale.Scale,
 		padx = padx,
 		pady = pady,
+		op = e.kind == 'image' and (1 - e.frame.ImageTransparency) or 1,
 	}
 end
 
@@ -1467,7 +1600,7 @@ positionToolbar = function(e)
 	end
 	for _, h in ipairs(e.handles) do
 		if h.kind ~= 'corner' then
-			h.frame.Position = UDim2.fromOffset(cur.X, cur.Y + ROW_Y[h.kind])
+			h.frame.Position = UDim2.fromOffset(cur.X, cur.Y + (h.row or ROW_Y[h.kind] or 0))
 		end
 	end
 end
@@ -1480,14 +1613,15 @@ local function updateBox(e)
 		box.Position = UDim2.fromOffset(p.X, p.Y)
 		box.Size = UDim2.fromOffset(z.X, z.Y)
 		local rs = root.AbsoluteSize
+		local tbh = e.tbH or TB_H
 		local cx = math.clamp(p.X + z.X / 2, 94, math.max(94, rs.X - 94))
 		local py
-		if p.Y + z.Y + 14 + TB_H + 8 <= rs.Y then
+		if p.Y + z.Y + 14 + tbh + 8 <= rs.Y then
 			py = p.Y + z.Y + 14
-		elseif p.Y - 36 - TB_H >= 0 then
-			py = p.Y - 36 - TB_H
+		elseif p.Y - 36 - tbh >= 0 then
+			py = p.Y - 36 - tbh
 		else
-			py = math.max(0, math.min(p.Y + z.Y - TB_H - 8, rs.Y - TB_H - 8))
+			py = math.max(0, math.min(p.Y + z.Y - tbh - 8, rs.Y - tbh - 8))
 		end
 		if not e.handles then
 			return
@@ -1508,7 +1642,7 @@ end
 local function removeControls(e)
 	local handles = e.handles
 	e.handles, e.ui = nil, nil
-	e.tb, e.tbCur = nil, nil
+	e.tb, e.tbCur, e.tbH = nil, nil, nil
 	if not handles then
 		return
 	end
@@ -1647,6 +1781,8 @@ local function makeStepper(e, kind, title, color)
 	local function stepOnce(dir)
 		if kind == 'pad' then
 			stepPadding(e, dir)
+		elseif kind == 'opacity' then
+			stepOpacity(e, dir * 0.05)
 		else
 			stepScale(e, dir * 0.05)
 		end
@@ -1921,6 +2057,80 @@ local function makeDirRow(e)
 	}
 end
 
+local function makeInput(e, mode)
+	local wrap = makeWrap()
+	local f = Instance.new('Frame')
+	f.Position = UDim2.fromOffset(2, 2)
+	f.Size = UDim2.fromOffset(176, 32)
+	f.BackgroundColor3 = DARK
+	f.BackgroundTransparency = 0.06
+	f.BorderSizePixel = 0
+	f.ZIndex = 102
+	f.Parent = wrap
+	addCorner(f, 8)
+	local stroke = addStroke(f, WHITE, 0.88, 1)
+
+	local box = Instance.new('TextBox')
+	box.Position = UDim2.fromOffset(10, 2)
+	box.Size = UDim2.fromOffset(156, 28)
+	box.BackgroundTransparency = 1
+	box.ClearTextOnFocus = false
+	box.ClipsDescendants = true
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 12
+	box.TextColor3 = WHITE
+	box.PlaceholderColor3 = Color3.fromRGB(140, 140, 140)
+	box.PlaceholderText = mode == 'image' and 'Image id or .png link' or 'Type text'
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	box.ZIndex = 104
+	box.Parent = f
+
+	local function current()
+		if mode == 'image' then
+			return e.imageSrc or ''
+		end
+		return e.frame.Text
+	end
+
+	box.Text = current()
+
+	box.Focused:Connect(function()
+		TweenService:Create(stroke, HOVER, { Color = ACCENT, Transparency = 0, Thickness = 1.5 }):Play()
+	end)
+	box.FocusLost:Connect(function()
+		TweenService:Create(stroke, HOVER, { Color = WHITE, Transparency = 0.88, Thickness = 1 }):Play()
+		if mode == 'image' then
+			if box.Text ~= (e.imageSrc or '') then
+				e.touched = true
+				e.reset = false
+				e.srcEdited = true
+				applyImage(e, box.Text)
+			end
+		end
+	end)
+
+	if mode == 'text' then
+		box:GetPropertyChangedSignal('Text'):Connect(function()
+			if box:IsFocused() then
+				e.touched = true
+				e.reset = false
+				e.textEdited = true
+				e.frame.Text = box.Text
+			end
+		end)
+	end
+
+	return {
+		frame = wrap,
+		kind = 'input',
+		sync = function()
+			if not box:IsFocused() then
+				box.Text = current()
+			end
+		end,
+	}
+end
+
 local function makeControls(e)
 	if e.handles or not e.box then
 		return
@@ -1956,18 +2166,31 @@ local function makeControls(e)
 		end
 	end
 
-	table.insert(handles, makeStepper(e, 'pad', 'Padding', PAD_COLOR))
-	table.insert(handles, makeStepper(e, 'scale', 'Scale', SCALE_COLOR))
-	table.insert(handles, makeAlign(e))
-	table.insert(handles, makeDirRow(e))
+	if e.kind == 'image' then
+		table.insert(handles, makeStepper(e, 'scale', 'Scale', SCALE_COLOR))
+		table.insert(handles, makeStepper(e, 'opacity', 'Opacity', OPACITY_COLOR))
+		table.insert(handles, makeInput(e, 'image'))
+	elseif e.kind == 'text' then
+		table.insert(handles, makeStepper(e, 'scale', 'Scale', SCALE_COLOR))
+		table.insert(handles, makeInput(e, 'text'))
+	else
+		table.insert(handles, makeStepper(e, 'pad', 'Padding', PAD_COLOR))
+		table.insert(handles, makeStepper(e, 'scale', 'Scale', SCALE_COLOR))
+		table.insert(handles, makeAlign(e))
+		table.insert(handles, makeDirRow(e))
+	end
 
-	e.handles = handles
+	local row = 0
 	e.ui = {}
 	for _, h in ipairs(handles) do
 		if h.kind ~= 'corner' then
+			h.row = row
+			row += 40
 			e.ui[h.kind] = h
 		end
 	end
+	e.tbH = row - 4
+	e.handles = handles
 	updateBox(e)
 	refreshReadout(e)
 end
@@ -2352,6 +2575,9 @@ local function commit()
 				e.layout:IsA('UIGridLayout') and e.layout.StartCorner.Name or 'TopLeft',
 				W,
 				H,
+				e.textEdited and e.frame.Text or '',
+				e.srcEdited and (e.imageSrc or '') or '',
+				e.trEdited and e.frame.ImageTransparency or -1,
 			}
 			e.base = makeBase(e, W, H)
 		elseif e.reset then
@@ -2378,6 +2604,12 @@ local function captureState(e)
 		fd = e.layout.FillDirection.Name,
 		sc = e.layout:IsA('UIGridLayout') and e.layout.StartCorner.Name or nil,
 		vis = e.frame.Visible,
+		text = e.kind == 'text' and e.frame.Text or nil,
+		img = e.kind == 'image' and (e.imageSrc or '') or nil,
+		tr = e.kind == 'image' and e.frame.ImageTransparency or nil,
+		te = e.textEdited,
+		se = e.srcEdited,
+		re = e.trEdited,
 	}
 end
 
@@ -2393,6 +2625,18 @@ local function restore(e, st)
 	if st.sc then
 		e.layout.StartCorner = Enum.StartCorner[st.sc]
 	end
+	if e.kind == 'text' and st.text ~= nil then
+		e.frame.Text = st.text
+	end
+	if e.kind == 'image' then
+		if st.img ~= nil and (e.imageSrc or '') ~= st.img then
+			applyImage(e, st.img)
+		end
+		if st.tr ~= nil then
+			e.frame.ImageTransparency = st.tr
+		end
+	end
+	e.textEdited, e.srcEdited, e.trEdited = st.te, st.se, st.re
 	if e.frame.Visible ~= st.vis then
 		e.frame.Visible = st.vis
 		if editing then
@@ -2545,7 +2789,7 @@ UserInputService.InputEnded:Connect(function(input)
 	end
 end)
 
-local reserved = { Name = true, Layout = true, FillDirection = true, Scale = true }
+local reserved = { Name = true, Layout = true, FillDirection = true, Scale = true, Type = true, Image = true }
 local layoutProps = {
 	Padding = true,
 	CellSize = true,
@@ -2559,13 +2803,34 @@ local layoutProps = {
 
 local function New(config)
 	config = config or {}
-	local frame = Instance.new('Frame')
+	local tname = string.lower(tostring(config.Type or 'Layout'))
+	local kind = 'layout'
+	if tname == 'image' or tname == 'imagelabel' then
+		kind = 'image'
+	elseif tname == 'text' or tname == 'textlabel' then
+		kind = 'text'
+	end
+
+	local frame
+	if kind == 'image' then
+		frame = Instance.new('ImageLabel')
+		frame.ScaleType = Enum.ScaleType.Stretch
+		frame.Size = UDim2.fromScale(0.2, 0.2)
+	elseif kind == 'text' then
+		frame = Instance.new('TextLabel')
+		frame.Font = Enum.Font.GothamMedium
+		frame.TextColor3 = WHITE
+		frame.Text = 'Text'
+		frame.Size = UDim2.fromScale(0.3, 0.08)
+	else
+		frame = Instance.new('Frame')
+		frame.Size = UDim2.fromScale(0.3, 0.3)
+	end
 	frame.Name = config.Name or 'UIFrame'
 	frame.BackgroundTransparency = 1
 	frame.BorderSizePixel = 0
-	frame.Size = UDim2.fromScale(0.3, 0.3)
 
-	local layout = Instance.new(config.Layout == 'Grid' and 'UIGridLayout' or 'UIListLayout')
+	local layout = Instance.new((kind == 'layout' and config.Layout == 'Grid') and 'UIGridLayout' or 'UIListLayout')
 	layout.FillDirection = Enum.FillDirection[config.FillDirection or 'Vertical']
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Parent = frame
@@ -2583,6 +2848,10 @@ local function New(config)
 		end
 	end
 
+	if kind == 'text' then
+		frame.TextScaled = true
+	end
+
 	local key = frame.Name
 	local n = 1
 	while entries[key] do
@@ -2592,6 +2861,7 @@ local function New(config)
 
 	local e = {
 		key = key,
+		kind = kind,
 		frame = frame,
 		layout = layout,
 		uiscale = uiscale,
@@ -2604,6 +2874,12 @@ local function New(config)
 		reset = false,
 	}
 	e.defaultPadX, e.defaultPadY = getPad(e)
+	if kind == 'image' then
+		e.defaultImgTr = frame.ImageTransparency
+		if config.Image ~= nil then
+			applyImage(e, config.Image)
+		end
+	end
 	e.def = captureState(e)
 	entries[key] = e
 	frame.Parent = root
